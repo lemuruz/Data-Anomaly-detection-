@@ -1,6 +1,26 @@
 import pandas as pd
 import torch
 from torch.utils.data import random_split, TensorDataset
+# from torchmetrics.classification import Accuracy
+from torchmetrics.classification import MulticlassAccuracy
+
+
+
+
+if torch.cuda.is_available():
+    device = "cuda"
+elif hasattr(torch.backends, "mps") and torch.backends.mps.is_available():
+    device = "mps"
+else:
+    device = "cpu"
+
+
+
+class_names = ['Normal', 'Broken', 'Recovering']
+# train_acc = Accuracy(task="multiclass", num_classes=3).to(device)
+train_acc = MulticlassAccuracy(num_classes=3,average='none').to(device)
+weights = torch.tensor([1.0, 200.0, 1.0]).to(device)
+
 data = pd.read_csv('sensor.csv')
 data["machine_status"] = (
     data["machine_status"]
@@ -44,7 +64,8 @@ test_dataloader = torch.utils.data.DataLoader(test_dataset, batch_size=64, shuff
 #         if std != 0:
 #             data[col] = (data[col] - data[col].mean()) / std
 print(data.head())
-device = torch.accelerator.current_accelerator().type if torch.accelerator.is_available() else "cpu"
+
+print(f"Using device: {device}")
 class NeuralNetwork(torch.nn.Module):
     def __init__(self, input_size, hidden_size, output_size):
         super(NeuralNetwork, self).__init__()
@@ -58,7 +79,7 @@ class NeuralNetwork(torch.nn.Module):
         out = self.fc2(out)
         return out
 model = NeuralNetwork(input_size=len(sensor_cols), hidden_size=64, output_size=3).to(device)
-loss_fn = torch.nn.CrossEntropyLoss()
+loss_fn = torch.nn.CrossEntropyLoss(weight=weights)
 optimizer = torch.optim.SGD(model.parameters(), lr=0.001)
 
 def train (traindata,model ,loss_fn,optimizer):
@@ -77,25 +98,28 @@ def train (traindata,model ,loss_fn,optimizer):
         optimizer.step()
         optimizer.zero_grad()
 
-        if batch % 100 == 0:
-            loss, current = loss.item(), (batch + 1) * len(X)
-            print(f"loss: {loss:>7f}  [{current:>5d}/{size:>5d}]")
+        # if batch % 100 == 0:
+        #     loss, current = loss.item(), (batch + 1) * len(X)
+        #     print(f"loss: {loss:>7f}  [{current:>5d}/{size:>5d}]")
 
 def test(testdata, model, loss_fn):
     size = len(testdata.dataset)
     num_batches = len(testdata)
     model.eval()
+    train_acc.reset()
     test_loss, correct = 0, 0
     with torch.no_grad():
         for X, y in testdata:
             X, y = X.to(device), y.to(device)
             pred = model(X)
-            test_loss += loss_fn(pred, y).item()
-            correct += (pred.argmax(1) == y).type(torch.float).sum().item()
-    test_loss /= num_batches
-    correct /= size
-    print(f"Test Error: \n Accuracy: {(100*correct):>0.1f}%, Avg loss: {test_loss:>8f} \n")
-
+            train_acc.update(pred.argmax(1), y)
+            
+    # print("Train Accuracy : ", train_acc.compute())
+    accuracies = train_acc.compute()
+    print("--- Per-Class Accuracy ---")
+    for i, name in enumerate(class_names):
+        print(f"{name:12}: {accuracies[i]*100:>6.2f}%")
+    print("--------------------------")
 
 epochs = 5
 for t in range(epochs):
