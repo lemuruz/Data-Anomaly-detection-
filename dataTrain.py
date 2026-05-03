@@ -1,9 +1,11 @@
+import numpy
 import pandas as pd
 import torch
-from torch.utils.data import random_split, TensorDataset
+
+from torch.utils.data import random_split, TensorDataset,WeightedRandomSampler
 # from torchmetrics.classification import Accuracy
 from torchmetrics.classification import MulticlassAccuracy
-
+from sklearn.model_selection import train_test_split
 
 
 
@@ -46,84 +48,177 @@ std[std == 0] = 1
 data[sensor_cols] = (data[sensor_cols] - data[sensor_cols].mean()) / std
 data[sensor_cols] = data[sensor_cols].replace([float("inf"), -float("inf")], 0).fillna(0)
 # convert data
-X = torch.tensor(data[sensor_cols].values, dtype=torch.float32)
-y = torch.tensor(data["machine_status"].values, dtype=torch.long)
-print("X has NaN:", torch.isnan(X).any().item())
-print("X has Inf:", torch.isinf(X).any().item())
-print("y has NaN:", torch.isnan(y).any().item())
-dataset = TensorDataset(X, y)
-train_size = int(0.8 * len(dataset))
-test_size = len(dataset) - train_size
-train_dataset, test_dataset = random_split(dataset, [train_size, test_size])
-train_dataloader = torch.utils.data.DataLoader(train_dataset, batch_size=64, shuffle=True)
-test_dataloader = torch.utils.data.DataLoader(test_dataset, batch_size=64, shuffle=False)
-# for col in data.columns:
-#     if col.startswith("sensor_"):
-#         data[col] = data[col].fillna(data[col].mean())
-#         std = data[col].std()
-#         if std != 0:
-#             data[col] = (data[col] - data[col].mean()) / std
-print(data.head())
+# X = torch.tensor(data[sensor_cols].values, dtype=torch.float32)
+# y = torch.tensor(data["machine_status"].values, dtype=torch.long)
 
+# dataset = TensorDataset(X, y)
+normal_data = data[data["machine_status"] == 0]
+anomalous_data = data[data["machine_status"] != 0]
+
+train_normal_data, test_normal_data = train_test_split(
+    normal_data,
+    test_size=0.2,
+    random_state=42,
+)
+
+test_df = pd.concat([test_normal_data, anomalous_data])
+X_train = torch.tensor(train_normal_data[sensor_cols].values, dtype=torch.float32)
+y_train = torch.tensor(train_normal_data["machine_status"].values, dtype=torch.long)
+
+X_test = torch.tensor(test_df[sensor_cols].values, dtype=torch.float32)
+y_test = torch.tensor(test_df["machine_status"].values, dtype=torch.long)
+train_dataset = TensorDataset(X_train, y_train)
+test_dataset = TensorDataset(X_test, y_test)
+
+
+# sampler = WeightedRandomSampler(samples_weight, len(samples_weight), replacement=True)
+test_dataloader = torch.utils.data.DataLoader(
+    test_dataset, 
+    batch_size=64, 
+    shuffle=True
+)
+train_dataloader = torch.utils.data.DataLoader(
+    train_dataset, 
+    batch_size=64, 
+    shuffle=False
+)
+# Check how many 'Broken' samples made it into training
+# train_broken_count = (y[train_idx] == 1).sum().item()
+# print(f"Number of 'Broken' samples in Training Set: {train_broken_count}")
+# print(data.head())
 print(f"Using device: {device}")
-class NeuralNetwork(torch.nn.Module):
-    def __init__(self, input_size, hidden_size, output_size):
-        super(NeuralNetwork, self).__init__()
-        self.fc1 = torch.nn.Linear(input_size, hidden_size)
-        self.relu = torch.nn.ReLU()
-        self.fc2 = torch.nn.Linear(hidden_size, output_size)
 
-    def forward(self, input):
-        out = self.fc1(input)
-        out = self.relu(out)
-        out = self.fc2(out)
-        return out
-model = NeuralNetwork(input_size=len(sensor_cols), hidden_size=64, output_size=3).to(device)
-loss_fn = torch.nn.CrossEntropyLoss(weight=weights)
-optimizer = torch.optim.SGD(model.parameters(), lr=0.001)
+class NeuralNetwork(torch.nn.Module):
+    def __init__(self, input_size):
+        super(NeuralNetwork, self).__init__()
+        # Encoder: Compresses the data
+        self.encoder = torch.nn.Sequential(
+            torch.nn.Linear(input_size, 40),
+            torch.nn.ReLU(),
+            torch.nn.Linear(40, 20),
+            torch.nn.ReLU()
+        )
+        # Decoder: Attempts to reconstruct the input
+        self.decoder = torch.nn.Sequential(
+            torch.nn.Linear(20, 40),
+            torch.nn.ReLU(),
+            torch.nn.Linear(40, input_size)
+        )
+
+    def forward(self, x):
+        encoded = self.encoder(x)
+        decoded = self.decoder(encoded)
+        return decoded
+model = NeuralNetwork(input_size=len(sensor_cols)).to(device)
+# loss_fn = torch.nn.CrossEntropyLoss(weight=weights)
+# loss_fn = torch.nn.CrossEntropyLoss()
+loss_fn = torch.nn.MSELoss()
+optimizer = torch.optim.Adam(model.parameters(), lr=0.001)
 
 def train (traindata,model ,loss_fn,optimizer):
     model.train()
     size = len(traindata.dataset)
 
-    for batch, (X, y) in enumerate(traindata):
-        X, y = X.to(device), y.to(device)
-
+    for batch, (X, _) in enumerate(traindata):
+        # X, y = X.to(device), y.to(device)
+        X = X.to(device)
         # Compute prediction error
         pred = model(X)
-        loss = loss_fn(pred, y)
+        loss = loss_fn(pred, X)
 
         # Backpropagation
         loss.backward()
         optimizer.step()
         optimizer.zero_grad()
 
-        # if batch % 100 == 0:
-        #     loss, current = loss.item(), (batch + 1) * len(X)
-        #     print(f"loss: {loss:>7f}  [{current:>5d}/{size:>5d}]")
 
-def test(testdata, model, loss_fn):
-    size = len(testdata.dataset)
-    num_batches = len(testdata)
+def errorEvaluation(testdata, model, loss_fn):
     model.eval()
-    train_acc.reset()
-    test_loss, correct = 0, 0
+    train_errors = []
+    # We track the reconstruction error for each category
+    errors = {name: [] for name in class_names}
+    
     with torch.no_grad():
         for X, y in testdata:
-            X, y = X.to(device), y.to(device)
-            pred = model(X)
-            train_acc.update(pred.argmax(1), y)
+            X = X.to(device)
+            # 1. Predict (Reconstruct)
+            reconstructed = model(X)
             
-    # print("Train Accuracy : ", train_acc.compute())
-    accuracies = train_acc.compute()
-    print("--- Per-Class Accuracy ---")
-    for i, name in enumerate(class_names):
-        print(f"{name:12}: {accuracies[i]*100:>6.2f}%")
-    print("--------------------------")
+            # 2. Calculate MSE loss per sample in the batch
+            # reduction='none' gives us the loss for every individual row
+            loss_per_sample = torch.nn.functional.mse_loss(reconstructed, X, reduction='none').mean(dim=1)
+            train_errors.extend(loss_per_sample.cpu().numpy())
+            # 3. Store errors based on their true labels
+            for i, label in enumerate(y):
+                class_name = class_names[label.item()]
+                errors[class_name].append(loss_per_sample[i].item())
 
-epochs = 5
+    mean_err = numpy.mean(train_errors)
+    std_err = numpy.std(train_errors)
+    threshold = mean_err + (3 * std_err)
+    print("\n--- Calibration Results (Baseline) ---")
+    print(f"Mean: {mean_err:.6f} | Std: {std_err:.6f}")
+    print(f"Calculated Threshold: {threshold:.6f}")
+
+    print("--- Avg Reconstruction Error (Lower is better) ---")
+    for name in class_names:
+        if errors[name]:
+            avg_err = numpy.mean(errors[name])
+            print(f"{name:12}: {avg_err:.6f}")
+    print("--------------------------------------------------")
+
+    return threshold
+
+def test(threshold, test_dataloader, model):
+    print(f"\n--- Detailed Performance Breakdown (Threshold: {threshold:.6f}) ---")
+    model.eval()
+    
+    # Initialize counters for each class
+    # Structure: { 'Normal': [count_below, count_above], ... }
+    results = {name: {"below": 0, "above": 0} for name in class_names}
+    
+    with torch.no_grad():
+        for X_batch, y_batch in test_dataloader:
+            X_batch = X_batch.to(device)
+            reconstructed = model(X_batch)
+            
+            # Calculate individual errors
+            loss = torch.nn.functional.mse_loss(reconstructed, X_batch, reduction='none').mean(dim=1)
+            
+            # Check each sample in the batch
+            for i in range(len(y_batch)):
+                label_idx = y_batch[i].item()
+                label_name = class_names[label_idx]
+                
+                if loss[i] > threshold:
+                    results[label_name]["above"] += 1
+                else:
+                    results[label_name]["below"] += 1
+
+    # Print formatting
+    print(f"{'Class Name':<12} | {'Total':<8} | {'Predicted Normal':<18} | {'Predicted Anomaly'}")
+    print("-" * 65)
+    
+    for name in class_names:
+        below = results[name]["below"]
+        above = results[name]["above"]
+        total = below + above
+        
+        # Calculate success rate based on class type
+        if name == 'Normal':
+            success_rate = (below / total * 100) if total > 0 else 0
+            note = "(Stayed Below)"
+        else:
+            success_rate = (above / total * 100) if total > 0 else 0
+            note = "(Flagged Above)"
+            
+        print(f"{name:<12} | {total:<8} | {below:<18} | {above:<17} | {success_rate:>6.2f}% {note}")
+
+    print("-" * 65)
+epochs = 20
 for t in range(epochs):
-    print(f"Epoch {t+1}\n-------------------------------")
+    print(f"-----------------Epoch {t+1}--------------")
     train(train_dataloader, model, loss_fn, optimizer)
-    test(test_dataloader, model, loss_fn)
-print("Done!")
+   
+threshold = errorEvaluation(train_dataloader, model, loss_fn)
+test(threshold, test_dataloader, model)
