@@ -95,12 +95,12 @@ class NeuralNetwork(torch.nn.Module):
         self.encoder = torch.nn.Sequential(
             torch.nn.Linear(input_size, 40),
             torch.nn.ReLU(),
-            torch.nn.Linear(40, 20),
+            torch.nn.Linear(40, 8),
             torch.nn.ReLU()
         )
         # Decoder: Attempts to reconstruct the input
         self.decoder = torch.nn.Sequential(
-            torch.nn.Linear(20, 40),
+            torch.nn.Linear(8, 40),
             torch.nn.ReLU(),
             torch.nn.Linear(40, input_size)
         )
@@ -215,7 +215,7 @@ def test(threshold, test_dataloader, model):
         print(f"{name:<12} | {total:<8} | {below:<18} | {above:<17} | {success_rate:>6.2f}% {note}")
 
     print("-" * 65)
-epochs = 20
+epochs = 15
 for t in range(epochs):
     print(f"-----------------Epoch {t+1}--------------")
     train(train_dataloader, model, loss_fn, optimizer)
