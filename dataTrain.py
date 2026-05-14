@@ -1,3 +1,5 @@
+import os
+
 import numpy
 import pandas as pd
 import torch
@@ -222,3 +224,5 @@ for t in range(epochs):
    
 threshold = errorEvaluation(train_dataloader, model, loss_fn)
 test(threshold, test_dataloader, model)
+print(f"Saving model to: {os.getcwd()}")
+torch.save(model.state_dict(), "autoencoder_model.pth")
